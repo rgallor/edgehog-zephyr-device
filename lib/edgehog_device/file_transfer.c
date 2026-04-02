@@ -22,19 +22,34 @@
 
 #include "log.h"
 
+#include <zephyr/fs/fs.h>
+#include <zephyr/fs/littlefs.h>
+
 EDGEHOG_LOG_MODULE_REGISTER(file_transfer, CONFIG_EDGEHOG_DEVICE_FILE_TRANSFER_LOG_LEVEL);
 
 /************************************************
  *        Defines, constants and typedef        *
  ***********************************************/
 
-#define FILE_TRANSFER_SERVICE_THREAD_STACK_SIZE 8192
+#define FILE_TRANSFER_SERVICE_THREAD_STACK_SIZE (8192 * 2)
 #define FILE_TRANSFER_SERVICE_THREAD_PRIORITY 5
 #define FILE_TRANSFER_SERVICE_THREAD_RUNNING_BIT (1)
 #define FILE_TRANSFER_SERVICE_MSGQ_GET_TIMEOUT 100
 #define FILE_TRANSFER_PERCENTAGE 100
 #define FILE_TRANSFER_REQ_TIMEOUT_MS (60 * 1000)
 #define FILE_TRANSFER_ERROR_MSG_SIZE 50
+
+#define MAX_PATH_LEN 255
+#define MAX_FT_FILE_SIZE (64 * 1024 * 1024)
+#define PARTITION_NODE DT_NODELABEL(lfs1)
+
+#if DT_NODE_EXISTS(PARTITION_NODE)
+FS_FSTAB_DECLARE_ENTRY(PARTITION_NODE);
+#else /* PARTITION_NODE */
+#error "Could not find the littlefs partition!"
+#endif /* PARTITION_NODE */
+
+struct fs_mount_t *mountpoint = &FS_FSTAB_ENTRY(PARTITION_NODE);
 
 // NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables)
 K_THREAD_STACK_DEFINE(file_transfer_service_stack_area, FILE_TRANSFER_SERVICE_THREAD_STACK_SIZE);
@@ -76,8 +91,14 @@ static char **duplicate_string_array(const astarte_data_stringarray_t *src);
 static edgehog_result_t http_get_server_to_device_request_cbk(
     bool *abort_flag, http_download_chunk_t *download_chunk, void *user_data)
 {
+    edgehog_result_t eres = EDGEHOG_RESULT_OK;
+
+    struct fs_file_t file;
+    fs_file_t_init(&file);
+
     if (!user_data) {
         EDGEHOG_LOG_ERR("Unable to read user data context");
+        eres = EDGEHOG_RESULT_HTTP_REQUEST_ABORTED;
         goto error;
     }
 
@@ -87,26 +108,55 @@ static edgehog_result_t http_get_server_to_device_request_cbk(
         EDGEHOG_LOG_ERR("Unable to read chunk");
         ft_data->posix_errno = EMSGSIZE;
         ft_data->message = "Unable to read chunk data";
+        eres = EDGEHOG_RESULT_HTTP_REQUEST_ABORTED;
         goto error;
     }
 
-    // store the file
-    if (download_chunk->chunk_size > 0 && ft_data->file) {
-        // check potential buffer overflow
-        if (ft_data->current_offset + download_chunk->chunk_size <= ft_data->file_size_bytes) {
+    char fname[MAX_PATH_LEN] = { 0 };
+    int rc = snprintf(fname, sizeof(fname), "%s/%s", mountpoint->mnt_point, ft_data->id);
 
-            memcpy(ft_data->file + ft_data->current_offset, download_chunk->chunk_start_addr,
-                download_chunk->chunk_size);
+    if (rc >= sizeof(fname)) {
+        EDGEHOG_LOG_ERR("FT failed to create filename: %d", rc); // NOLINT
+        ft_data->posix_errno = EMSGSIZE;
+        ft_data->message = "Unable to create filename";
+        eres = EDGEHOG_RESULT_FILE_SYSTEM_ERROR;
+        goto error;
+    }
 
-            ft_data->current_offset += download_chunk->chunk_size;
-            EDGEHOG_LOG_DBG("Downloaded %d bytes", ft_data->current_offset);
-        } else {
+    // store the file in littlefs
+    if (download_chunk->chunk_size > 0) {
+        if (ft_data->current_offset + download_chunk->chunk_size > ft_data->file_size_bytes) {
             EDGEHOG_LOG_WRN(
                 "Potential buffer overflow, the received chunk exceed declared dimensions");
             ft_data->posix_errno = EMSGSIZE;
             ft_data->message = "the received data exceed declared dimensions";
+            eres = EDGEHOG_RESULT_HTTP_REQUEST_ABORTED;
             goto error;
         }
+
+        rc = fs_open(&file, fname, FS_O_CREATE | FS_O_READ | FS_O_WRITE | FS_O_APPEND);
+        if (rc < 0) {
+            EDGEHOG_LOG_ERR("FT failed to open file %s: %d", fname, rc);
+            ft_data->posix_errno = EIO;
+            ft_data->message = "Couldn't open the file";
+            eres = EDGEHOG_RESULT_FILE_SYSTEM_ERROR;
+            goto error;
+        }
+
+        EDGEHOG_LOG_INF("FT file %s opened successfully", fname);
+
+        rc = fs_write(&file, download_chunk->chunk_start_addr, download_chunk->chunk_size);
+        if (rc < 0 || (rc == 0 && rc != download_chunk->chunk_size)) {
+            EDGEHOG_LOG_ERR("FT failed to write to file %s: %d", fname, rc);
+            ft_data->posix_errno = EIO;
+            ft_data->message = "Couldn't write to file";
+            eres = EDGEHOG_RESULT_FILE_SYSTEM_ERROR;
+            goto error;
+        }
+
+        EDGEHOG_LOG_DBG("FT downloaded %d bytes and written to file %s", rc, fname);
+
+        ft_data->current_offset += download_chunk->chunk_size;
     }
 
     if (ft_data->progress) {
@@ -129,6 +179,7 @@ static edgehog_result_t http_get_server_to_device_request_cbk(
             EDGEHOG_LOG_ERR("Unable to send File transfer progress");
             ft_data->posix_errno = EPIPE;
             ft_data->message = "Unable to send File transfer progress";
+            eres = EDGEHOG_RESULT_HTTP_REQUEST_ABORTED;
             goto error;
         }
 
@@ -140,25 +191,27 @@ static edgehog_result_t http_get_server_to_device_request_cbk(
             EDGEHOG_LOG_ERR("File transfer download aborted");
             ft_data->posix_errno = EMSGSIZE;
             ft_data->message = "File transfer download aborted";
+            eres = EDGEHOG_RESULT_HTTP_REQUEST_ABORTED;
             goto error;
         }
 
         EDGEHOG_LOG_DBG("Download completed successfully!");
         ft_data->posix_errno = 0;
         ft_data->message = "Download completed successfully!";
-
-        // TODO: close here the file
     }
 
-    return EDGEHOG_RESULT_OK;
+    goto out;
 
 error:
-
     edgehog_http_download_abort(abort_flag);
 
-    // TODO: close here the file
+out:
+    rc = fs_close(&file);
+    if (rc != 0) {
+        EDGEHOG_LOG_ERR("FT failed to close file %s", fname);
+    }
 
-    return EDGEHOG_RESULT_HTTP_REQUEST_ABORTED;
+    return eres;
 }
 
 /************************************************
